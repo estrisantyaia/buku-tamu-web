@@ -164,6 +164,10 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const activeRef = useRef(false);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const onScannedRef = useRef(onScanned);
+  onScannedRef.current = onScanned;
   const [active, setActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [manual, setManual] = useState("");
@@ -177,6 +181,50 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
 
   useEffect(() => stop, []);
 
+  // Elemen <video> baru muncul di layar SETELAH setActive(true) selesai di-render.
+  // Jadi stream kamera disambungkan di sini (begitu videonya benar-benar ada),
+  // bukan langsung di start() — kalau tidak, gambarnya tidak tampil (layar hitam).
+  useEffect(() => {
+    if (!active) return;
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    if (!video || !stream) return;
+    let cancelled = false;
+    video.srcObject = stream;
+    // BarcodeDetector (cepat) kalau didukung browser; kalau tidak, pakai
+    // jsQR sebagai fallback universal supaya kamera tetap jalan di semua browser.
+    const Detector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
+    const detector = Detector ? new Detector({ formats: ["qr_code"] }) : null;
+    const loop = async () => {
+      if (cancelled || !activeRef.current || busyRef.current) return;
+      try {
+        let value: string | null = null;
+        if (video.readyState >= 2) {
+          if (detector) {
+            const results = await detector.detect(video);
+            value = results[0]?.rawValue ?? null;
+          } else {
+            value = decodeQrWithJsQr(video, 640);
+          }
+        }
+        if (value) {
+          stop();
+          navigator.vibrate?.(80);
+          onScannedRef.current(value);
+          return;
+        }
+      } catch {
+        // A transient decode miss is expected while the card is moving.
+      }
+      window.setTimeout(() => void loop(), detector ? 420 : 600);
+    };
+    const begin = () => { if (!cancelled) void loop(); };
+    const playResult = video.play();
+    if (playResult !== undefined) playResult.then(begin, begin);
+    else begin();
+    return () => { cancelled = true; };
+  }, [active]);
+
   const start = async () => {
     setError(null);
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -188,38 +236,6 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
       streamRef.current = stream;
       activeRef.current = true;
       setActive(true);
-      const video = videoRef.current;
-      if (!video) return;
-      video.srcObject = stream;
-      await video.play();
-      // BarcodeDetector (cepat) kalau didukung browser; kalau tidak, pakai
-      // jsQR sebagai fallback universal supaya kamera tetap jalan di semua browser.
-      const Detector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
-      const detector = Detector ? new Detector({ formats: ["qr_code"] }) : null;
-      const loop = async () => {
-        if (!activeRef.current || busy) return;
-        try {
-          let value: string | null = null;
-          if (video.readyState >= 2) {
-            if (detector) {
-              const results = await detector.detect(video);
-              value = results[0]?.rawValue ?? null;
-            } else {
-              value = decodeQrWithJsQr(video, 640);
-            }
-          }
-          if (value) {
-            stop();
-            navigator.vibrate?.(80);
-            onScanned(value);
-            return;
-          }
-        } catch {
-          // A transient decode miss is expected while the card is moving.
-        }
-        window.setTimeout(() => void loop(), detector ? 420 : 600);
-      };
-      void loop();
     } catch {
       stop();
       setError("Kamera tidak dapat dibuka. Izinkan akses kamera, atau gunakan pilihan lain di bawah.");
