@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import QRCode from "qrcode";
+import jsQR from "jsqr";
+import * as XLSX from "xlsx";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { api, isSupabaseConfigured, type CheckInResponse, type Guest } from "./api";
 type Tab = "scan" | "guests" | "cards";
@@ -19,6 +21,7 @@ const icons = {
   plus: <path d="M12 5v14M5 12h14" />,
   edit: <path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z" />,
   download: <path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14" />,
+  upload: <path d="M12 15V3m0 0 5 5m-5-5-5 5M5 21h14" />,
   close: <path d="M18 6 6 18M6 6l12 12" />,
   image: <path d="M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Zm0 11 5-5 4 4 2-2 7 7M16 8h.01" />,
 };
@@ -136,6 +139,27 @@ function WeddingMark() {
   );
 }
 
+function decodeQrWithJsQr(
+  source: HTMLVideoElement | ImageBitmap,
+  maxSize: number,
+): string | null {
+  const srcW = source instanceof HTMLVideoElement ? source.videoWidth : source.width;
+  const srcH = source instanceof HTMLVideoElement ? source.videoHeight : source.height;
+  if (!srcW || !srcH) return null;
+  const scale = Math.min(1, maxSize / Math.max(srcW, srcH));
+  const w = Math.max(1, Math.round(srcW * scale));
+  const h = Math.max(1, Math.round(srcH * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0, w, h);
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const code = jsQR(imageData.data, w, h, { inversionAttempts: "attemptBoth" });
+  return code?.data ?? null;
+}
+
 function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; busy: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -155,9 +179,8 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
 
   const start = async () => {
     setError(null);
-    const Detector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
-    if (!Detector) {
-      setError("Pemindai QR belum didukung browser ini. Gunakan unggah gambar atau masukkan kode kartu.");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError("Kamera tidak tersedia di browser ini. Gunakan unggah gambar atau masukkan kode kartu.");
       return;
     }
     try {
@@ -169,24 +192,32 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
       if (!video) return;
       video.srcObject = stream;
       await video.play();
-      const detector = new Detector({ formats: ["qr_code"] });
+      // BarcodeDetector (cepat) kalau didukung browser; kalau tidak, pakai
+      // jsQR sebagai fallback universal supaya kamera tetap jalan di semua browser.
+      const Detector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
+      const detector = Detector ? new Detector({ formats: ["qr_code"] }) : null;
       const loop = async () => {
         if (!activeRef.current || busy) return;
         try {
+          let value: string | null = null;
           if (video.readyState >= 2) {
-            const results = await detector.detect(video);
-            const value = results[0]?.rawValue;
-            if (value) {
-              stop();
-              navigator.vibrate?.(80);
-              onScanned(value);
-              return;
+            if (detector) {
+              const results = await detector.detect(video);
+              value = results[0]?.rawValue ?? null;
+            } else {
+              value = decodeQrWithJsQr(video, 640);
             }
+          }
+          if (value) {
+            stop();
+            navigator.vibrate?.(80);
+            onScanned(value);
+            return;
           }
         } catch {
           // A transient decode miss is expected while the card is moving.
         }
-        window.setTimeout(() => void loop(), 420);
+        window.setTimeout(() => void loop(), detector ? 420 : 600);
       };
       void loop();
     } catch {
@@ -198,16 +229,17 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
   const pickImage = async (file: File | undefined) => {
     if (!file) return;
     setError(null);
-    const Detector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
-    if (!Detector) {
-      setError("Browser ini belum bisa membaca QR dari gambar. Masukkan kode kartu secara manual.");
-      return;
-    }
     try {
       const bitmap = await createImageBitmap(file);
-      const results = await new Detector({ formats: ["qr_code"] }).detect(bitmap);
+      let value: string | null = null;
+      const Detector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
+      if (Detector) {
+        const results = await new Detector({ formats: ["qr_code"] }).detect(bitmap);
+        value = results[0]?.rawValue ?? null;
+      } else {
+        value = decodeQrWithJsQr(bitmap, 1000);
+      }
       bitmap.close();
-      const value = results[0]?.rawValue;
       if (!value) {
         setError("QR belum terbaca. Coba gambar yang lebih terang dan tidak terpotong.");
         return;
@@ -306,11 +338,146 @@ function GuestForm({ guest, onClose }: { guest?: Guest; onClose: () => void }) {
   );
 }
 
+type ParsedGuest = { name: string; origin: string };
+
+const NAME_HEADERS = ["nama", "name", "nama tamu", "guest", "guest name"];
+const ORIGIN_HEADERS = ["asal", "origin", "asal instansi", "asal/instansi", "instansi", "dari", "alamat", "kota"];
+
+function parseExcelFile(file: File): Promise<{ guests: ParsedGuest[]; skipped: number }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const wb = XLSX.read(reader.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        if (!ws) throw new Error("empty");
+        const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: "" });
+        if (rows.length === 0) throw new Error("empty");
+        const headers = Object.keys(rows[0]);
+        const norm = (s: string) => s.toLocaleLowerCase("id-ID").trim().replace(/[_\s/]+/g, " ");
+        const nameKey = headers.find((h) => NAME_HEADERS.includes(norm(h)));
+        const originKey = headers.find((h) => ORIGIN_HEADERS.includes(norm(h)));
+        if (!nameKey) throw new Error("noheader");
+        const guests: ParsedGuest[] = [];
+        let skipped = 0;
+        for (const row of rows) {
+          const name = String(row[nameKey] ?? "").trim();
+          if (!name) { skipped++; continue; }
+          const origin = originKey ? String(row[originKey] ?? "").trim() : "";
+          guests.push({ name, origin: origin || "-" });
+        }
+        resolve({ guests, skipped });
+      } catch {
+        reject(new Error("parse"));
+      }
+    };
+    reader.onerror = () => reject(new Error("read"));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function downloadTemplate() {
+  const ws = XLSX.utils.json_to_sheet([
+    { Nama: "Contoh Tamu", Asal: "Jakarta" },
+    { Nama: "Tamu Kedua", Asal: "Bandung" },
+  ]);
+  ws["!cols"] = [{ wch: 24 }, { wch: 24 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Tamu");
+  XLSX.writeFile(wb, "template-buku-tamu.xlsx");
+}
+
+function ImportExcel({ onClose }: { onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [preview, setPreview] = useState<ParsedGuest[] | null>(null);
+  const [skipped, setSkipped] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [parsing, setParsing] = useState(false);
+  const [done, setDone] = useState<number | null>(null);
+  const importMutation = useMutation({
+    mutationFn: (guests: ParsedGuest[]) => api.importGuests(guests),
+    onSuccess: async (res) => {
+      await queryClient.invalidateQueries({ queryKey: ["guests"] });
+      setDone(res.count);
+    },
+  });
+
+  const pickFile = async (file: File | undefined) => {
+    if (!file) return;
+    setError(null);
+    setDone(null);
+    setParsing(true);
+    try {
+      const { guests, skipped: skippedRows } = await parseExcelFile(file);
+      if (guests.length === 0) {
+        setError("Tidak ada data tamu yang valid. Pastikan file punya kolom Nama.");
+        setPreview(null);
+      } else {
+        setFileName(file.name);
+        setPreview(guests);
+        setSkipped(skippedRows);
+      }
+    } catch {
+      setError("File tidak bisa dibaca. Pakai .xlsx / .xls / .csv dengan kolom Nama dan Asal.");
+      setPreview(null);
+    } finally {
+      setParsing(false);
+    }
+  };
+
+  return (
+    <div className="sheet-overlay" role="dialog" aria-modal="true" aria-label="Import tamu dari Excel">
+      <div className="bottom-sheet import-sheet">
+        <div className="sheet-heading">
+          <div><p>Tambah banyak sekaligus</p><h2>Import Excel</h2></div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Tutup"><Icon name="close" /></button>
+        </div>
+        {done !== null ? (
+          <div className="import-done">
+            <div className="result-icon"><Icon name="check" size={34} /></div>
+            <h3>{done} tamu berhasil ditambahkan!</h3>
+            <p>Kartu aksesnya langsung jadi dan bisa dilihat di tab Kartu.</p>
+            <button className="primary-button" onClick={onClose}>Tutup</button>
+          </div>
+        ) : (
+          <>
+            <p className="import-hint">File Excel harus punya kolom <b>Nama</b> dan <b>Asal</b> di baris pertama. Belum punya filenya? Unduh templatenya dulu.</p>
+            <div className="import-actions">
+              <label className="quiet-button file-pick">
+                <Icon name="upload" size={18} /> Pilih file
+                <input type="file" accept=".xlsx,.xls,.csv" aria-label="Pilih file Excel" onChange={(event) => void pickFile(event.target.files?.[0])} />
+              </label>
+              <button className="quiet-button" onClick={downloadTemplate}><Icon name="download" size={18} /> Template</button>
+            </div>
+            {parsing && <p className="import-status"><span className="spinner" /> Membaca file…</p>}
+            {error && <p className="inline-error" role="alert">{error}</p>}
+            {preview && (
+              <>
+                <p className="import-status"><b>{preview.length}</b> tamu siap diimport{skipped > 0 ? ` (${skipped} baris kosong dilewati)` : ""} dari <i>{fileName}</i></p>
+                <ul className="import-preview">
+                  {preview.slice(0, 5).map((guest, i) => <li key={i}><b>{guest.name}</b><span>{guest.origin}</span></li>)}
+                  {preview.length > 5 && <li className="more">+ {preview.length - 5} tamu lainnya…</li>}
+                </ul>
+                <button className="primary-button import-submit" disabled={importMutation.isPending} onClick={() => importMutation.mutate(preview)}>
+                  {importMutation.isPending ? "Mengimport…" : `Import ${preview.length} tamu`}
+                </button>
+                {importMutation.isError && <p className="inline-error">Import gagal. Coba lagi.</p>}
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function GuestList({ guests }: { guests: Guest[] }) {
   const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "present" | "waiting">("all");
   const [editing, setEditing] = useState<Guest | "new" | null>(null);
+  const [importing, setImporting] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Guest | null>(null);
   const attendance = useMutation({
     mutationFn: (input: { id: number; present: boolean }) => api.setAttendance(input),
@@ -333,7 +500,10 @@ function GuestList({ guests }: { guests: Guest[] }) {
     <section className="content-section">
       <div className="section-heading">
         <div><p>Daftar undangan</p><h2>Tamu & kehadiran</h2></div>
-        <button className="add-button" onClick={() => setEditing("new")}><Icon name="plus" size={19} /> Tambah</button>
+        <div className="heading-actions">
+          <button className="quiet-button import-button" onClick={() => setImporting(true)}><Icon name="upload" size={18} /> Excel</button>
+          <button className="add-button" onClick={() => setEditing("new")}><Icon name="plus" size={19} /> Tambah</button>
+        </div>
       </div>
       <label className="search-box"><Icon name="search" size={19} /><input aria-label="Cari tamu" placeholder="Cari nama atau asal" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
       <div className="filter-row" aria-label="Filter kehadiran">
@@ -355,6 +525,7 @@ function GuestList({ guests }: { guests: Guest[] }) {
         {filtered.length === 0 && <div className="empty-state"><p>Tidak ada tamu yang cocok.</p><span>Coba kata lain atau ubah filter.</span></div>}
       </div>
       {editing && <GuestForm guest={editing === "new" ? undefined : editing} onClose={() => setEditing(null)} />}
+      {importing && <ImportExcel onClose={() => setImporting(false)} />}
       {deleteTarget && (
         <div className="sheet-overlay" role="dialog" aria-modal="true" aria-label="Hapus tamu">
           <div className="confirm-sheet"><h2>Hapus {deleteTarget.name}?</h2><p>Kartu aksesnya tidak akan bisa dipakai lagi.</p><div><button className="quiet-button" onClick={() => setDeleteTarget(null)}>Batal</button><button className="danger-button" onClick={() => remove.mutate(deleteTarget.id)}>{remove.isPending ? "Menghapus…" : "Hapus"}</button></div></div>

@@ -186,4 +186,27 @@ export const api = {
     if (error) throw error;
     return { ok: (data?.length ?? 0) > 0 };
   },
+
+  async importGuests(
+    items: { name: string; origin: string }[],
+  ): Promise<{ ok: true; count: number }> {
+    ensureConfigured();
+    const now = new Date().toISOString();
+    const rows = items.map(({ name, origin }) => {
+      const cardCode = `BT-${crypto.randomUUID().replace(/-/g, "").slice(0, 10).toUpperCase()}`;
+      return {
+        name,
+        origin,
+        card_code: cardCode,
+        qr_payload: `Nama: ${name}\nAsal: ${origin}\nKode: ${cardCode}`,
+        created_at: now,
+        updated_at: now,
+      };
+    });
+    for (let i = 0; i < rows.length; i += 100) {
+      const { error } = await supabase.from("guests").insert(rows.slice(i, i + 100));
+      if (error) throw error;
+    }
+    return { ok: true, count: rows.length };
+  },
 };
