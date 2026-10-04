@@ -16,6 +16,7 @@ const icons = {
   guests: <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />,
   card: <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h13A2.5 2.5 0 0 1 21 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5v-11ZM3 9h18M7 15h4" />,
   camera: <path d="M14.5 4 16 7h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3l1.5-3h5ZM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" />,
+  switch: <><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></>,
   check: <path d="m5 12 4 4L19 6" />,
   search: <path d="m21 21-4.35-4.35M19 11a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z" />,
   plus: <path d="M12 5v14M5 12h14" />,
@@ -160,7 +161,7 @@ function decodeQrWithJsQr(
   return code?.data ?? null;
 }
 
-function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; busy: boolean }) {
+function Scanner({ onScanned, busy, restartToken }: { onScanned: (payload: string) => void; busy: boolean; restartToken: number }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const activeRef = useRef(false);
@@ -168,7 +169,12 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
   busyRef.current = busy;
   const onScannedRef = useRef(onScanned);
   onScannedRef.current = onScanned;
+  const facingModeRef = useRef<"environment" | "user">("environment");
+  const switchingRef = useRef(false);
+  const touchStartXRef = useRef<number | null>(null);
   const [active, setActive] = useState(false);
+  const [facingMode, setFacingMode] = useState<"environment" | "user">("environment");
+  const [session, setSession] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [manual, setManual] = useState("");
 
@@ -184,6 +190,8 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
   // Elemen <video> baru muncul di layar SETELAH setActive(true) selesai di-render.
   // Jadi stream kamera disambungkan di sini (begitu videonya benar-benar ada),
   // bukan langsung di start() — kalau tidak, gambarnya tidak tampil (layar hitam).
+  // `session` dinaikkan setiap kali stream baru siap, supaya loop pindai selalu
+  // dimulai ulang tepat setelah stream tersedia (tidak balapan).
   useEffect(() => {
     if (!active) return;
     const video = videoRef.current;
@@ -223,7 +231,15 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
     if (playResult !== undefined) playResult.then(begin, begin);
     else begin();
     return () => { cancelled = true; };
-  }, [active]);
+  }, [active, session]);
+
+  // Sinyal dari parent: nyalakan ulang kamera otomatis (mis. setelah notif hasil ditutup).
+  useEffect(() => {
+    if (restartToken > 0 && !activeRef.current && !busyRef.current && !switchingRef.current) {
+      void start();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restartToken]);
 
   const start = async () => {
     setError(null);
@@ -232,13 +248,53 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facingModeRef.current } }, audio: false });
       streamRef.current = stream;
       activeRef.current = true;
       setActive(true);
+      setSession((s) => s + 1);
     } catch {
       stop();
       setError("Kamera tidak dapat dibuka. Izinkan akses kamera, atau gunakan pilihan lain di bawah.");
+    }
+  };
+
+  const switchCamera = async () => {
+    if (!activeRef.current || switchingRef.current) return;
+    switchingRef.current = true;
+    const next = facingModeRef.current === "environment" ? "user" : "environment";
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: next } }, audio: false });
+      if (!activeRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      facingModeRef.current = next;
+      setFacingMode(next);
+      streamRef.current = stream;
+      setSession((s) => s + 1);
+    } catch {
+      setError("Kamera tidak dapat dibuka. Izinkan akses kamera, atau gunakan pilihan lain di bawah.");
+      stop();
+    } finally {
+      switchingRef.current = false;
+    }
+  };
+
+  const onTouchStart = (event: React.TouchEvent) => {
+    touchStartXRef.current = event.touches[0]?.clientX ?? null;
+  };
+
+  const onTouchEnd = (event: React.TouchEvent) => {
+    const startX = touchStartXRef.current;
+    touchStartXRef.current = null;
+    if (startX === null) return;
+    const endX = event.changedTouches[0]?.clientX ?? startX;
+    if (Math.abs(endX - startX) > 60) {
+      void switchCamera();
     }
   };
 
@@ -276,8 +332,24 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
       <div className="scan-corners" aria-hidden="true"><span /><span /><span /><span /></div>
       {active ? (
         <>
-          <video ref={videoRef} className="camera-feed" playsInline muted aria-label="Tampilan kamera pemindai QR" />
+          <video
+            ref={videoRef}
+            className="camera-feed"
+            playsInline
+            muted
+            aria-label="Tampilan kamera pemindai QR"
+            onTouchStart={onTouchStart}
+            onTouchEnd={onTouchEnd}
+          />
           <div className="scan-line" aria-hidden="true" />
+          <button
+            className="camera-switch"
+            onClick={() => void switchCamera()}
+            aria-label={facingMode === "environment" ? "Ganti ke kamera depan" : "Ganti ke kamera belakang"}
+            title={facingMode === "environment" ? "Kamera belakang — ketuk untuk ganti ke depan" : "Kamera depan — ketuk untuk ganti ke belakang"}
+          >
+            <Icon name="switch" size={20} />
+          </button>
           <button className="camera-stop" onClick={stop}>Hentikan kamera</button>
         </>
       ) : (
@@ -309,6 +381,12 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
 function ResultPanel({ result, onClose }: { result: CheckInResponse; onClose: () => void }) {
   const guest = result.guest;
   const found = guest !== null;
+  const autoContinue = result.status === "checked_in" || result.status === "already_present";
+  useEffect(() => {
+    if (!autoContinue) return;
+    const timer = window.setTimeout(onClose, 2200);
+    return () => window.clearTimeout(timer);
+  }, [autoContinue, onClose, result]);
   return (
     <div className="result-overlay" role="dialog" aria-modal="true" aria-label="Hasil pemindaian">
       <div className={`result-panel ${found ? "success" : "error"}`}>
@@ -317,6 +395,7 @@ function ResultPanel({ result, onClose }: { result: CheckInResponse; onClose: ()
         <h2>{guest?.name ?? "QR belum dikenali"}</h2>
         <p>{guest ? guest.origin : "Pastikan QR berasal dari kartu akses acara ini."}</p>
         {guest?.attended_at && <time>{formatArrival(guest.attended_at)}</time>}
+        {autoContinue && <p className="result-autoclose">Lanjut scan otomatis…</p>}
         <button className="primary-button" onClick={onClose}>{found ? "Scan tamu berikutnya" : "Coba lagi"}</button>
       </div>
     </div>
@@ -596,6 +675,7 @@ export function App() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<Tab>("scan");
   const [result, setResult] = useState<CheckInResponse | null>(null);
+  const [scanToken, setScanToken] = useState(0);
   const guestsQuery = useQuery({ queryKey: ["guests"], queryFn: () => api.listGuests({}) });
   const checkIn = useMutation({
     mutationFn: (payload: string) => api.checkInGuest({ payload }),
@@ -604,6 +684,20 @@ export function App() {
       await queryClient.invalidateQueries({ queryKey: ["guests"] });
     },
   });
+
+  const closeResult = () => {
+    setResult(null);
+    // Kamera nyala lagi otomatis supaya alur scan tidak terputus.
+    setScanToken((t) => t + 1);
+  };
+
+  // Kalau check-in gagal (mis. jaringan), kamera juga nyala lagi otomatis
+  // setelah jeda singkat supaya panitia bisa langsung scan ulang.
+  useEffect(() => {
+    if (!checkIn.isError) return;
+    const timer = window.setTimeout(() => setScanToken((t) => t + 1), 2500);
+    return () => window.clearTimeout(timer);
+  }, [checkIn.isError]);
 
   if (guestsQuery.isPending) return <ScreenState><span className="spinner large" /><p>Menyiapkan daftar tamu…</p></ScreenState>;
   if (guestsQuery.isError) return <ScreenState><h2>Daftar belum dapat dibuka</h2><p>Periksa koneksi lalu coba lagi.</p><button className="primary-button" onClick={() => void guestsQuery.refetch()}>Coba lagi</button></ScreenState>;
@@ -623,7 +717,7 @@ export function App() {
               <p className="page-kicker">Selamat datang</p>
               <h1>Scan kartu aksesmu</h1>
               <p className="lead">Hadapkan QR pada kartu ke kamera. Namamu akan langsung ditandai hadir.</p>
-              <Scanner onScanned={(payload) => checkIn.mutate(payload)} busy={checkIn.isPending} />
+              <Scanner onScanned={(payload) => checkIn.mutate(payload)} busy={checkIn.isPending} restartToken={scanToken} />
               {checkIn.isError && <p className="inline-error">Kartu belum bisa diperiksa. Coba sekali lagi.</p>}
             </div>
             <aside className="today-panel">
@@ -643,7 +737,7 @@ export function App() {
         <button className={tab === "guests" ? "active" : ""} onClick={() => setTab("guests")}><Icon name="guests" /><span>Tamu</span></button>
         <button className={tab === "cards" ? "active" : ""} onClick={() => setTab("cards")}><Icon name="card" /><span>Kartu</span></button>
       </nav>
-      {result && <ResultPanel result={result} onClose={() => setResult(null)} />}
+      {result && <ResultPanel result={result} onClose={closeResult} />}
     </div>
   );
 }

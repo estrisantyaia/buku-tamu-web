@@ -229,3 +229,6 @@ h1 { margin: 0; max-width: 620px; font-family: Georgia, Cambria, serif; font-siz
 .import-done h3 { font-family: Georgia, Cambria, serif; font-size: 24px; font-weight: 500; margin: 0 0 6px; }
 .import-done p { color: var(--dim); font-size: 14px; margin: 0 0 18px; }
 .import-done .primary-button { width: 100%; background: var(--accent); color: white; }
+
+.camera-switch { position: absolute; z-index: 4; top: 18px; right: 18px; width: 44px; height: 44px; border: 1px solid rgba(255,255,255,.4); border-radius: 50%; display: grid; place-items: center; background: rgba(31,8,15,.72); color: white; cursor: pointer; }
+.result-autoclose { margin: 10px 0 0; color: var(--dim); font-size: 12px; font-style: italic; }
