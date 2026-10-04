@@ -279,7 +279,7 @@ function Scanner({ onScanned, busy }: { onScanned: (payload: string) => void; bu
       <div className="scanner-fallbacks">
         <label className="quiet-button file-button">
           <Icon name="image" size={18} /> Pilih gambar QR
-          <input aria-label="Pilih gambar QR" type="file" accept="image/*" onChange={(event) => void pickImage(event.target.files?.[0])} />
+          <input aria-label="Pilih gambar QR" type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; void pickImage(file); }} />
         </label>
         <form onSubmit={submitManual} className="manual-form">
           <input aria-label="Kode kartu" value={manual} onChange={(event) => setManual(event.target.value)} placeholder="Kode kartu" />
@@ -446,7 +446,7 @@ function ImportExcel({ onClose }: { onClose: () => void }) {
             <div className="import-actions">
               <label className="quiet-button file-pick">
                 <Icon name="upload" size={18} /> Pilih file
-                <input type="file" accept=".xlsx,.xls,.csv" aria-label="Pilih file Excel" onChange={(event) => void pickFile(event.target.files?.[0])} />
+                <input type="file" accept=".xlsx,.xls,.csv" aria-label="Pilih file Excel" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; void pickFile(file); }} />
               </label>
               <button className="quiet-button" onClick={downloadTemplate}><Icon name="download" size={18} /> Template</button>
             </div>
